@@ -23,7 +23,7 @@ from tensorflow.python.framework import ops as framework_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.util import compat
-
+import copy
 
 class LiftToGraphTest(test.TestCase):
 
@@ -83,6 +83,65 @@ class LiftToGraphTest(test.TestCase):
       self.assertItemsEqual(op.colocation_groups(),  # Expect default self-ref.
                             [compat.as_bytes('loc:@%s' % op.name)])
 
+  def _testPostOrder(self, graph, seeds, graph_without_back_edges):
+    ordering = lift_to_graph._post_order(seeds, graph)
+    ordering.reverse()
+    # `ordering should now be a topological ordering of the graph with back edges removed
+    topologically_ordered_node_index = {node: index for (index, node)
+                                        in enumerate(ordering)}
+
+    # For each node, verify that all its children have higher topological indices
+    for node, children in graph_without_back_edges.items():
+      node_index = topologically_ordered_node_index[node]
+      for child in children:
+        child_index = topologically_ordered_node_index[child]
+        assert node_index < child_index
+
+  def testPostOrderOnConnectedGraph(self):
+    """Test post-order directed graph traversal on a graph with a single connected component."""
+
+    # Maps the key N of each node to the set of keys of nodes connected to N by edges
+    # directed away from N.
+    graph = {1: {2, 3},
+             2: {4, 5},
+             3: {6, 7},
+             4: {},
+             5: {1, 8, 9, 10},
+             6: {},
+             7: {11, 12},
+             8: {},
+             9: {},
+             10: {},
+             11: {8},
+             12: {}}
+
+    # Remove an edge from a copy of the graph to make it acyclic.
+    graph_without_back_edges = copy.deepcopy(graph)
+    graph_without_back_edges[5].remove(1)
+
+    self._testPostOrder(graph, [1], graph_without_back_edges)
+    self._testPostOrder(graph, list(range(1, 13)), graph_without_back_edges)
+
+  def testPostOrderOnDisconnectedGraph(self):
+    """Test post-order directed graph traversal on a graph with two connected component."""
+
+    # Maps the key N of each node to the set of keys of nodes connected to N by edges
+    # directed away from N.
+    graph = {1: {3, 4, 8},
+             2: {5, 6, 7},
+             3: {},
+             4: {8},
+             5: {8},
+             6: {},
+             7: {5},
+             8: {1}}
+
+    # Remove an edge from a copy of the graph to make it acyclic.
+    graph_without_back_edges = copy.deepcopy(graph)
+    graph_without_back_edges[8].remove(1)
+
+    self._testPostOrder(graph, [1, 2], graph_without_back_edges)
+    self._testPostOrder(graph, list(range(1, 9)), graph_without_back_edges)
 
 if __name__ == '__main__':
   test.main()

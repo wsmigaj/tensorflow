@@ -199,6 +199,55 @@ def _copy_source(s, graph, op_map, handle_captures, inverse_captures,
   op_map[s.op] = copied_placeholder.op
 
 
+def _post_order(seeds: list, node_children: dict) -> list:
+  """Return the post-ordering of all nodes in a graph found via depth-first
+  searches started from the specified seeds.
+
+  Note that this is equivalent to a reverse topological ordering when the graph
+  does not have cycles.
+
+  Args:
+    seeds:
+      The list of nodes from which depth-first searches will be started.
+    node_children:
+      A dictionary mapping each node in the graph to the set of its children.
+
+  Returns:
+    The list of visited nodes in post-ordering.
+
+  Note:
+    This is essentially a Python reimplementation of the GetPostOrder() function
+    from tensorflow\core\graph\algorithm.h.
+  """
+  ENTER = 0
+  LEAVE = 1
+  ordering = []
+  visited_nodes = set()
+
+  # Push ENTER actions for all seed nodes on the stack (in reverse order, so that
+  # they are popped from the stack in the input order)
+  work_stack = [(node, ENTER) for node in reversed(seeds)]
+  while work_stack:
+    node, action = work_stack.pop()
+
+    if action == LEAVE:
+      ordering.append(node)
+      continue
+
+    if node in visited_nodes:
+      continue
+    visited_nodes.add(node)
+
+    # Schedule a LEAVE action after processing all descendants of the current node
+    work_stack.append((node, LEAVE))
+
+    for child in node_children[node]:
+      if child not in visited_nodes:
+        work_stack.append((child, ENTER))
+
+  return ordering
+
+
 @tf_export("__internal__.lift_to_graph", v1=[])
 def lift_to_graph(tensors,
                   graph,
@@ -247,7 +296,7 @@ def lift_to_graph(tensors,
   visited_ops = set(x.op for x in sources)
   op_outputs = collections.defaultdict(set)
 
-  # First we extract the subgraph between init_tensors and sources.
+  # Extract the subgraph between init_tensors and sources.
   for init_tensor in init_tensors:
     sources.update(op_selector.map_subgraph(
         init_tensor=init_tensor,
@@ -257,42 +306,18 @@ def lift_to_graph(tensors,
         op_outputs=op_outputs,
         add_sources=add_sources))
 
-  # Try to topologically sort the nodes we've extracted. Now we know how many of
-  # their outputs are part of this subgraph.
-  ops_to_copy = []
-  marked_ops = set([])
-  ops_to_visit = [_as_operation(t) for t in init_tensors
-                  if not op_outputs[_as_operation(t)]]
-  unvisited_ops = set(ops_to_visit)
-  while unvisited_ops:
-    while ops_to_visit:
-      op = ops_to_visit.pop()
-      if op in marked_ops:
-        continue
-      marked_ops.add(op)
-      ops_to_copy.append(op)
-      for inp in op_selector.graph_inputs(op):
-        # Don't lift the TPUReplicateMetadata nodes out of the function, because
-        # it has no registered kernels.
-        if inp.type == "TPUReplicateMetadata":
-          continue
-        unvisited_ops.add(inp)
-        if (all(x in marked_ops for x in op_outputs[inp]) and
-            inp not in sources):
-          ops_to_visit.append(inp)
-    unvisited_ops.difference_update(marked_ops)
-    if unvisited_ops:
-      # `unvisited_ops` should only have elements if the graph has a loop. In
-      # this case we want to keep copying and there's no topological ordering;
-      # we'll do ugly post-hoc mutations instead.
-      ops_to_visit.append(next(iter(unvisited_ops)))
-
-  # When the topological sort fails due to loops, it can result in exceptions
-  # later when copying a node which inputs haven't been copied yet. We can
-  # improve that pseudo-topological order slightly by putting the ops without
-  # inputs, such as constants, at the start of the topological order (i.e at
-  # the end of ops_to_copy).
-  ops_to_copy.sort(key=(lambda op: len(op_selector.graph_inputs(op)) == 0))
+  # Use depth-first search to find a post-order traversal index of the subgraph
+  # ops in post-order. This is a reverse topological ordering if the subgraph
+  # is acyclic. Otherwise it still has the property that if an op N in a
+  # strongly connected component C depends on an op N' in a different strongly
+  # connected component C', then the last node of C' is traversed after the
+  # last node of C. In particular, if N' does not belong to any loops (hence
+  # forming a strongly connected component with just a single element),
+  # it is traversed after N.
+  ops_to_copy = _post_order(list(visited_ops), op_outputs)
+  # Don't lift TPUReplicateMetadata nodes because they have no registered
+  # kernels.
+  ops_to_copy = [op for op in ops_to_copy if op.name != "TPUReplicateMetadata"]
 
   # When lifting from one FuncGraph to another, we will need to capture the
   # relevant tensors as well.
@@ -306,7 +331,7 @@ def lift_to_graph(tensors,
       inverse_captures[internal_capture] = external_capture
     internal_captures = base_graph.internal_captures
 
-  # ops_to_copy now holds a reverse topologically sorted list of ops which
+  # ops_to_copy now holds an ordered list of ops which
   # ends in the initializer. We copy those to the outermost graph and
   # build the initialization op there.
   with graph.as_default():

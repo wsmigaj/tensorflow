@@ -16,26 +16,33 @@
 import os
 
 
+from tensorflow.core.protobuf import config_pb2
 from tensorflow.core.protobuf import meta_graph_pb2
 from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.eager import backprop
+from tensorflow.python.eager import context
 from tensorflow.python.eager import def_function
 from tensorflow.python.eager import wrap_function
 from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import convert_to_constants
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import importer as graph_def_importer
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_spec
 from tensorflow.python.framework import test_util
+from tensorflow.python.grappler import tf_optimizer
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import init_ops
+from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import state_ops
+from tensorflow.python.ops import tensor_array_ops
 from tensorflow.python.ops import variable_scope
 from tensorflow.python.ops import variables
 from tensorflow.python.ops.ragged import ragged_factory_ops
 from tensorflow.python.ops.ragged import ragged_tensor
 from tensorflow.python.platform import test
 from tensorflow.python.training import saver as saver_lib
+from tensorflow.python.training.saver import export_meta_graph
 
 
 class WrapFunctionTest(test.TestCase):
@@ -574,6 +581,81 @@ class WrappedGraphTest(test.TestCase):
     self.assertEqual(g.variables['v'].numpy(), 3)
     update_var(constant_op.constant(12))
     self.assertEqual(g.variables['v'].numpy(), 12)
+
+  def testCyclicGraph(self):
+    """
+    Tests importing a graph containing two TensorListReserve operations
+    dependent on the same element_shape tensor.
+
+    Adapted from a bug reproducer posted to
+    https://github.com/tensorflow/tensorflow/issues/55736.
+    """
+
+    @def_function.function
+    def fibonacci(n):
+      if n > 2:
+        ta = tensor_array_ops.TensorArray(dtypes.float32, size=n)
+        tb = tensor_array_ops.TensorArray(dtypes.int32, size=n)
+        ta = ta.write(0, 0.)
+        ta = ta.write(1, 1.)
+        tb = tb.write(0, 0)
+        tb = tb.write(1, 1)
+
+        for i in range(2, n):
+          ta = ta.write(i, ta.read(i - 1) + ta.read(i - 2))
+          tb = tb.write(i, tb.read(i - 1) + tb.read(i - 2))
+
+        return ta.stack() + math_ops.cast(tb.stack(), dtype=dtypes.float32)
+      else:
+        return 2.0 * math_ops.range(n, dtype=dtypes.float32)
+
+    def run_grappler(func, graph_def):
+      meta_graph = export_meta_graph(graph_def=graph_def, graph=func.graph)
+
+      # Add a collection 'train_op' so that Grappler knows the outputs.
+      fetch_collection = meta_graph_pb2.CollectionDef()
+      for array in func.inputs + func.outputs:
+        fetch_collection.node_list.value.append(array.name)
+      meta_graph.collection_def["train_op"].CopyFrom(fetch_collection)
+
+      # Configure Grappler to execute one pass of common subgraph elimination.
+      config = config_pb2.ConfigProto()
+      rewrite_options = config.graph_options.rewrite_options
+      rewrite_options.optimizers.extend([
+        "common_subgraph_elimination"
+      ])
+      rewrite_options.meta_optimizer_iterations = 1
+      return tf_optimizer.OptimizeGraph(config, meta_graph)
+
+    func = fibonacci.get_concrete_function(
+      tensor_spec.TensorSpec([], dtypes.int32))
+
+    # Freeze the function
+    frozen_func = convert_to_constants.convert_variables_to_constants_v2(func)
+
+    # Run common subgraph elimination
+    graph_def = frozen_func.graph.as_graph_def()
+    new_graph_def = run_grappler(func, graph_def)
+
+    # Remove the old functions from the context
+    for f in new_graph_def.library.function:
+      while context.context().has_function(f.signature.name):
+        context.context().remove_function(f.signature.name)
+
+    # Reconstruct a function from the graph definition
+    new_func = wrap_function.function_from_graph_def(
+      new_graph_def,
+      [tensor.name for tensor in frozen_func.inputs],
+      [tensor.name for tensor in frozen_func.outputs])
+
+    result = new_func(constant_op.constant(5))[0].numpy()
+    self.assertAllEqual(result, [0., 2., 2., 4., 6.])
+    result = new_func(constant_op.constant(3))[0].numpy()
+    self.assertAllEqual(result, [0., 2., 2.])
+    result = new_func(constant_op.constant(2))[0].numpy()
+    self.assertAllEqual(result, [0., 2.])
+    result = new_func(constant_op.constant(1))[0].numpy()
+    self.assertAllEqual(result, [0.])
 
 
 if __name__ == '__main__':
